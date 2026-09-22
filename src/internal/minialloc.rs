@@ -141,23 +141,28 @@ impl<F> MiniAllocator<F> {
         for (from_mini_sector, &to_mini_sector) in
             self.minifat.iter().enumerate()
         {
-            if to_mini_sector <= consts::MAX_REGULAR_SECTOR {
-                if to_mini_sector as usize >= self.minifat.len() {
-                    malformed!(
-                        "MiniFAT has {} entries, but mini sector {} points to \
-                         {}",
-                        self.minifat.len(),
-                        from_mini_sector,
-                        to_mini_sector
-                    );
+            match consts::classify_fat_entry(to_mini_sector) {
+                consts::FatEntryKind::Pointer(to_mini_sector) => {
+                    if to_mini_sector as usize >= self.minifat.len() {
+                        malformed!(
+                            "MiniFAT has {} entries, but mini sector {} \
+                             points to {}",
+                            self.minifat.len(),
+                            from_mini_sector,
+                            to_mini_sector
+                        );
+                    }
+                    if pointees.contains(&to_mini_sector) {
+                        malformed!(
+                            "mini sector {} pointed to twice",
+                            to_mini_sector
+                        );
+                    }
+                    pointees.insert(to_mini_sector);
                 }
-                if pointees.contains(&to_mini_sector) {
-                    malformed!(
-                        "mini sector {} pointed to twice",
-                        to_mini_sector
-                    );
-                }
-                pointees.insert(to_mini_sector);
+                // Sentinels (end-of-chain, free, FAT, DIFAT, and the invalid
+                // marker) require no further validation here.
+                _ => {}
             }
         }
 

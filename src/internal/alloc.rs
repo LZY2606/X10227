@@ -161,28 +161,34 @@ impl<F> Allocator<F> {
         let mut pointees = FnvHashSet::default();
         for from_sector in 0..self.fat.len() {
             let to_sector = self.fat[from_sector];
-            if to_sector <= consts::MAX_REGULAR_SECTOR {
-                if to_sector as usize >= self.fat.len() {
-                    if validation.is_strict() {
-                        malformed!(
-                            "FAT has {} entries, but sector {} points to {}",
-                            self.fat.len(),
-                            from_sector,
-                            to_sector
-                        );
+            match consts::classify_fat_entry(to_sector) {
+                consts::FatEntryKind::Pointer(to_sector) => {
+                    if to_sector as usize >= self.fat.len() {
+                        if validation.is_strict() {
+                            malformed!(
+                                "FAT has {} entries, but sector {} points to                                  {}",
+                                self.fat.len(),
+                                from_sector,
+                                to_sector
+                            );
+                        }
+                        // End the chain here instead, so that only a chain
+                        // that actually runs through this sector is affected
+                        // (it gets truncated), rather than the whole file.
+                        self.fat[from_sector] = consts::END_OF_CHAIN;
+                        continue;
                     }
-                    // End the chain here instead, so that only a chain
-                    // that actually runs through this sector is affected
-                    // (it gets truncated), rather than the whole file.
-                    self.fat[from_sector] = consts::END_OF_CHAIN;
-                    continue;
+                    if pointees.contains(&to_sector) {
+                        malformed!("sector {} pointed to twice", to_sector);
+                    }
+                    pointees.insert(to_sector);
                 }
-                if pointees.contains(&to_sector) {
-                    malformed!("sector {} pointed to twice", to_sector);
+                consts::FatEntryKind::Invalid => {
+                    malformed!("0x{:08X} is not a valid FAT entry", to_sector)
                 }
-                pointees.insert(to_sector);
-            } else if to_sector == consts::INVALID_SECTOR {
-                malformed!("0x{:08X} is not a valid FAT entry", to_sector);
+                // Sentinels (end-of-chain, free, FAT, and DIFAT markers)
+                // require no further validation here.
+                _ => {}
             }
         }
 

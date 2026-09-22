@@ -33,6 +33,41 @@ pub const ROOT_STREAM_ID: u32 = 0;
 pub const MAX_REGULAR_STREAM_ID: u32 = 0xfffffffa;
 pub const NO_STREAM: u32 = 0xffffffff;
 
+
+/// The structural meaning of a single FAT or MiniFAT entry value.
+///
+/// This is the single classifier shared by the production allocators when
+/// validating a file and by the read-only structure auditor; bounds checks
+/// (whether a pointer addresses an existing sector) are left to the caller,
+/// since they differ between the FAT, the MiniFAT, and chain contexts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatEntryKind {
+    /// A pointer to another regular sector or mini sector.
+    Pointer(u32),
+    /// End-of-chain marker (`0xFFFFFFFE`).
+    EndOfChain,
+    /// A free, unused sector (`0xFFFFFFFF`).
+    Free,
+    /// A sector holding part of the FAT itself (`0xFFFFFFFD`).
+    Fat,
+    /// A sector holding part of the DIFAT (`0xFFFFFFFC`).
+    Difat,
+    /// The reserved invalid-sector marker (`0xFFFFFFFB`).
+    Invalid,
+}
+
+/// Classifies a raw FAT/MiniFAT entry value the same way for every caller.
+pub fn classify_fat_entry(entry: u32) -> FatEntryKind {
+    match entry {
+        END_OF_CHAIN => FatEntryKind::EndOfChain,
+        FREE_SECTOR => FatEntryKind::Free,
+        FAT_SECTOR => FatEntryKind::Fat,
+        DIFAT_SECTOR => FatEntryKind::Difat,
+        INVALID_SECTOR => FatEntryKind::Invalid,
+        sector => FatEntryKind::Pointer(sector),
+    }
+}
+
 pub(crate) fn prettify(sectors: &[u32]) -> Vec<Sector> {
     let mut fmt = Vec::new();
     for s in sectors.iter() {
