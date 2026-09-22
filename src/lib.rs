@@ -66,6 +66,8 @@ pub use crate::internal::{Entries, Entry, Stream, Version};
 #[macro_use]
 mod internal;
 
+pub mod audit;
+
 //===========================================================================//
 
 /// Opens an existing compound file at the given path in read-only mode.
@@ -92,6 +94,7 @@ pub fn create<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 pub struct OpenOptions {
     pub(crate) max_buffer_size: usize,
     pub(crate) validation: Validation,
+    pub(crate) audit: bool,
 }
 
 impl OpenOptions {
@@ -113,6 +116,17 @@ impl OpenOptions {
     /// Any violation of the CFB spec will be treated as an error when parsing.
     pub fn strict(mut self) -> Self {
         self.validation = Validation::Strict;
+        self
+    }
+
+    /// Opts in to a structural audit of the file when it is opened.
+    ///
+    /// The audit classifies corruption in the FAT, DIFAT, MiniFAT, and
+    /// directory chains and attaches an [`audit::AuditReport`] to the
+    /// opened file (see [`CompoundFile::structural_audit_report`]).  It
+    /// never modifies the file.
+    pub fn structural_audit(mut self) -> Self {
+        self.audit = true;
         self
     }
 
@@ -159,6 +173,7 @@ impl OpenOptions {
             inner,
             self.validation,
             self.max_buffer_size,
+            self.audit,
         )
     }
 
@@ -180,6 +195,7 @@ impl Default for OpenOptions {
         OpenOptions {
             max_buffer_size: DEFAULT_STREAM_MAX_BUFFER_SIZE,
             validation: Validation::Permissive,
+            audit: false,
         }
     }
 }
@@ -192,6 +208,7 @@ impl Default for OpenOptions {
 pub struct CompoundFile<F> {
     minialloc: Arc<RwLock<MiniAllocator<F>>>,
     max_buffer_size: usize,
+    audit_report: Option<audit::AuditReport>,
 }
 
 impl<F> CompoundFile<F> {
@@ -206,6 +223,13 @@ impl<F> CompoundFile<F> {
     /// Returns the CFB format version used for this compound file.
     pub fn version(&self) -> Version {
         self.minialloc().version()
+    }
+
+    /// Returns the structural audit report computed when the file was
+    /// opened with [`OpenOptions::structural_audit`], or `None` if auditing
+    /// was not requested.
+    pub fn structural_audit_report(&self) -> Option<&audit::AuditReport> {
+        self.audit_report.as_ref()
     }
 
     fn stream_id_for_name_chain(&self, names: &[&str]) -> Option<u32> {
@@ -430,6 +454,7 @@ impl<F: Read + Seek> CompoundFile<F> {
         mut inner: F,
         validation: Validation,
         max_buffer_size: usize,
+        audit: bool,
     ) -> io::Result<CompoundFile<F>> {
         let inner_len = inner.seek(SeekFrom::End(0))?;
         if inner_len < consts::HEADER_LEN as u64 {
@@ -460,6 +485,18 @@ impl<F: Read + Seek> CompoundFile<F> {
                 header.version.sector_len()
             );
         }
+        let audit_report = if audit {
+            // Read the whole image once for the structural audit, then
+            // rewind so the normal parser sees the file from the start.
+            inner.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            inner.read_to_end(&mut bytes)?;
+            inner.seek(SeekFrom::Start(0))?;
+            Some(audit::audit_bytes(&bytes))
+        } else {
+            None
+        };
+
         let mut sectors = Sectors::new(header.version, inner_len, inner);
         let num_sectors = sectors.num_sectors();
 
@@ -698,6 +735,7 @@ impl<F: Read + Seek> CompoundFile<F> {
         Ok(CompoundFile {
             minialloc: Arc::new(RwLock::new(minialloc)),
             max_buffer_size,
+            audit_report,
         })
     }
     /// Writes a compacted copy of this compound file to `dest`, and returns
@@ -846,6 +884,7 @@ impl<F: Read + Write + Seek> CompoundFile<F> {
         Ok(CompoundFile {
             minialloc: Arc::new(RwLock::new(minialloc)),
             max_buffer_size,
+            audit_report: None,
         })
     }
 
