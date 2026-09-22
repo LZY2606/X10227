@@ -66,6 +66,8 @@ pub use crate::internal::{Entries, Entry, Stream, Version};
 #[macro_use]
 mod internal;
 
+pub mod audit;
+
 //===========================================================================//
 
 /// Opens an existing compound file at the given path in read-only mode.
