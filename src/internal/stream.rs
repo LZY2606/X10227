@@ -1,0 +1,647 @@
+use crate::internal::{consts, MiniAllocator, ObjType, SectorInit};
+use std::convert::TryFrom;
+use std::fmt;
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, RwLock, Weak};
+
+//===========================================================================//
+
+use crate::internal::stream_buffer::StreamBuffer;
+
+/// Reads and writes at least this large go straight to the underlying file
+/// rather than through the stream's buffer: copying them through the buffer
+/// (and growing it to hold them) costs more than the buffering saves.
+const DIRECT_IO_MIN: usize = 64 * 1024;
+
+/// How much of a stream `read_to_end` reads per call to the underlying
+/// file.
+const READ_TO_END_CHUNK: usize = 16 * 1024 * 1024;
+
+//===========================================================================//
+
+/// A stream entry in a compound file, much like a filesystem file.
+pub struct Stream<F> {
+    minialloc: Weak<RwLock<MiniAllocator<F>>>,
+    stream_id: u32,
+    total_len: u64,
+    buffer: StreamBuffer,
+    buf_offset_from_start: u64,
+    flusher: Option<Box<dyn Flusher<F>>>,
+}
+
+impl<F> Stream<F> {
+    pub(crate) fn new(
+        minialloc: &Arc<RwLock<MiniAllocator<F>>>,
+        stream_id: u32,
+        max_buffer_size: usize,
+    ) -> Stream<F> {
+        let total_len =
+            minialloc.read().unwrap().dir_entry(stream_id).stream_len;
+        Stream {
+            minialloc: Arc::downgrade(minialloc),
+            stream_id,
+            total_len,
+            buffer: StreamBuffer::new(max_buffer_size),
+            buf_offset_from_start: 0,
+            flusher: None,
+        }
+    }
+
+    fn minialloc(&self) -> io::Result<Arc<RwLock<MiniAllocator<F>>>> {
+        self.minialloc
+            .upgrade()
+            .ok_or_else(|| io::Error::other("CompoundFile was dropped"))
+    }
+
+    /// Returns the current length of the stream, in bytes.
+    pub fn len(&self) -> u64 {
+        self.total_len
+    }
+
+    /// Returns true if the stream is empty.
+    pub fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    fn current_position(&self) -> u64 {
+        self.buf_offset_from_start + (self.buffer.cursor() as u64)
+    }
+
+    fn flush_changes(&mut self) -> io::Result<()> {
+        if let Some(flusher) = self.flusher.take() {
+            flusher.flush_changes(self)?;
+        }
+        Ok(())
+    }
+}
+
+impl<F: Read + Write + Seek> Stream<F> {
+    /// Truncates or extends the stream, updating the size of this stream to
+    /// become `size`.
+    ///
+    /// If `size` is less than the stream's current size, then the stream will
+    /// be shrunk.  If it is greater than the stream's current size, then the
+    /// stream will be padded with zero bytes.
+    ///
+    /// Does not change the current read/write position within the stream,
+    /// unless the stream is truncated to before the current position, in which
+    /// case the position becomes the new end of the stream.
+    pub fn set_len(&mut self, size: u64) -> io::Result<()> {
+        if size != self.total_len {
+            let new_position = self.current_position().min(size);
+            self.flush_changes()?;
+            let minialloc = self.minialloc()?;
+            resize_stream(
+                &mut minialloc.write().unwrap(),
+                self.stream_id,
+                size,
+            )?;
+            self.total_len = size;
+            self.buf_offset_from_start = new_position;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn mark_modified(&mut self) {
+        if self.flusher.is_none() {
+            let flusher: Box<dyn Flusher<F>> = Box::new(FlushBuffer);
+            self.flusher = Some(flusher);
+        }
+    }
+}
+
+impl<F: Read + Seek> Stream<F> {
+    /// Reads into `buf` straight from the underlying file, from the current
+    /// position on.  The buffer must hold no unread data; it is emptied.
+    fn read_direct(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        debug_assert!(!self.buffer.has_remaining());
+        self.flush_changes()?;
+        let position = self.current_position();
+        self.buf_offset_from_start = position;
+        self.buffer.clear();
+        let minialloc = self.minialloc()?;
+        let num_bytes = read_data_from_stream(
+            &mut minialloc.write().unwrap(),
+            self.stream_id,
+            position,
+            buf,
+        )?;
+        self.buf_offset_from_start += num_bytes as u64;
+        Ok(num_bytes)
+    }
+}
+
+impl<F: Read + Seek> BufRead for Stream<F> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if !self.buffer.has_remaining()
+            && self.current_position() < self.total_len
+        {
+            self.flush_changes()?;
+            self.buf_offset_from_start += self.buffer.cursor() as u64;
+            let remaining = self.total_len - self.buf_offset_from_start;
+            let stream_id = self.stream_id;
+            let offset = self.buf_offset_from_start;
+            let minialloc = self.minialloc()?;
+            self.buffer.refill_with(remaining, |buf| {
+                read_data_from_stream(
+                    &mut minialloc.write().unwrap(),
+                    stream_id,
+                    offset,
+                    buf,
+                )
+            })?;
+        }
+        Ok(self.buffer.remaining_slice())
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.buffer.consume(amt);
+    }
+}
+
+impl<F: Read + Seek> Read for Stream<F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.len() >= DIRECT_IO_MIN && !self.buffer.has_remaining() {
+            return self.read_direct(buf);
+        }
+        let mut buffered_data = self.fill_buf()?;
+        let num_bytes = buffered_data.read(buf)?;
+        self.consume(num_bytes);
+        Ok(num_bytes)
+    }
+
+    /// Reads the rest of the stream straight into `buf`, which is grown
+    /// once to the exact size needed.
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let buffered = self.buffer.remaining_slice();
+        let buffered_len = buffered.len();
+        buf.extend_from_slice(buffered);
+        self.buffer.consume(buffered_len);
+        let position = self.current_position();
+        debug_assert!(position <= self.total_len);
+        let remaining =
+            usize::try_from(self.total_len - position).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "stream is too large to read into memory",
+                )
+            })?;
+        // A malformed file can claim any length for a stream; the chain
+        // behind it bounds what can actually be read, so reserve no more
+        // than that.
+        let capacity = {
+            let minialloc = self.minialloc()?;
+            let capacity = stream_capacity(
+                &mut minialloc.write().unwrap(),
+                self.stream_id,
+            )?;
+            usize::try_from(capacity.saturating_sub(position))
+                .unwrap_or(usize::MAX)
+        };
+        buf.try_reserve(remaining.min(capacity)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "not enough memory to read the stream",
+            )
+        })?;
+        // The reserved memory is filled a piece at a time, so that a
+        // malformed file claiming an enormous stream length doesn't cost a
+        // zero fill of all of it before the read fails.
+        let mut total = 0;
+        while total < remaining {
+            // Past the chain's capacity, a one byte read reports the
+            // short chain without growing the buffer any further.
+            let chunk = (remaining - total)
+                .min(READ_TO_END_CHUNK)
+                .min(capacity.saturating_sub(total).max(1));
+            let start = buf.len();
+            buf.resize(start + chunk, 0);
+            let num_bytes = match self.read_direct(&mut buf[start..]) {
+                Ok(num_bytes) => num_bytes,
+                Err(error) => {
+                    buf.truncate(start);
+                    return Err(error);
+                }
+            };
+            buf.truncate(start + num_bytes);
+            if num_bytes == 0 {
+                break;
+            }
+            total += num_bytes;
+        }
+        Ok(buffered_len + total)
+    }
+}
+
+impl<F: Read + Seek> Seek for Stream<F> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos: u64 =
+            match pos {
+                SeekFrom::Start(delta) => {
+                    if delta > self.total_len {
+                        invalid_input!(
+                        "Cannot seek to {} bytes from start, because stream \
+                         length is only {} bytes",
+                        delta, self.total_len,
+                    );
+                    }
+                    delta
+                }
+                SeekFrom::End(delta) => {
+                    if delta > 0 {
+                        invalid_input!(
+                        "Cannot seek to {} bytes past the end of the stream",
+                        delta,
+                    );
+                    } else {
+                        let delta = (-delta) as u64;
+                        if delta > self.total_len {
+                            invalid_input!(
+                                "Cannot seek to {} bytes before end, because \
+                             stream length is only {} bytes",
+                                delta,
+                                self.total_len,
+                            );
+                        }
+                        self.total_len - delta
+                    }
+                }
+                SeekFrom::Current(delta) => {
+                    let old_pos = self.current_position();
+                    debug_assert!(old_pos <= self.total_len);
+                    if delta < 0 {
+                        let delta = (-delta) as u64;
+                        if delta > old_pos {
+                            invalid_input!(
+                            "Cannot seek to {} bytes before current position, \
+                             which is only {}",
+                            delta, old_pos,
+                        );
+                        }
+                        old_pos - delta
+                    } else {
+                        let delta = delta as u64;
+                        let remaining = self.total_len - old_pos;
+                        if delta > remaining {
+                            invalid_input!(
+                            "Cannot seek to {} bytes after current position, \
+                             because there are only {} bytes remaining in the \
+                             stream",
+                            delta, remaining,
+                        );
+                        }
+                        old_pos + delta
+                    }
+                }
+            };
+        if new_pos < self.buf_offset_from_start
+            || new_pos
+                > self.buf_offset_from_start + self.buffer.filled_len() as u64
+        {
+            self.flush_changes()?;
+            self.buf_offset_from_start = new_pos;
+            self.buffer.clear();
+        } else {
+            self.buffer.seek((new_pos - self.buf_offset_from_start) as usize);
+        }
+        Ok(new_pos)
+    }
+}
+
+impl<F: Read + Write + Seek> Stream<F> {
+    /// Writes `buf` straight to the underlying file at the current
+    /// position, after flushing whatever the buffer holds; the buffer is
+    /// emptied.
+    fn write_direct(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.flush_changes()?;
+        let position = self.current_position();
+        self.buf_offset_from_start = position;
+        self.buffer.clear();
+        let minialloc = self.minialloc()?;
+        write_data_to_stream(
+            &mut minialloc.write().unwrap(),
+            self.stream_id,
+            position,
+            buf,
+        )?;
+        self.buf_offset_from_start = position + buf.len() as u64;
+        self.total_len = self.total_len.max(self.buf_offset_from_start);
+        Ok(buf.len())
+    }
+}
+
+impl<F: Read + Write + Seek> Write for Stream<F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() >= DIRECT_IO_MIN {
+            return self.write_direct(buf);
+        }
+        let num_bytes_written = match self.buffer.write_bytes(buf) {
+            Some(count) => count,
+            None => {
+                self.flush_changes()?;
+                self.buf_offset_from_start += self.buffer.cursor() as u64;
+                self.buffer.clear();
+                self.buffer.write_bytes(buf).unwrap_or(0)
+            }
+        };
+        if num_bytes_written > 0 {
+            self.mark_modified();
+            self.total_len = self.total_len.max(
+                self.buf_offset_from_start + self.buffer.filled_len() as u64,
+            );
+        }
+        Ok(num_bytes_written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_changes()?;
+        let minialloc = self.minialloc()?;
+        minialloc.write().unwrap().flush()?;
+        Ok(())
+    }
+}
+
+impl<F> fmt::Debug for Stream<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stream")
+            .field("stream_id", &self.stream_id)
+            .field("len", &self.total_len)
+            .field("position", &self.current_position())
+            .finish()
+    }
+}
+
+impl<F> Drop for Stream<F> {
+    fn drop(&mut self) {
+        let _ = self.flush_changes();
+    }
+}
+
+//===========================================================================//
+
+trait Flusher<F> {
+    fn flush_changes(&self, stream: &mut Stream<F>) -> io::Result<()>;
+}
+
+struct FlushBuffer;
+
+impl<F: Read + Write + Seek> Flusher<F> for FlushBuffer {
+    fn flush_changes(&self, stream: &mut Stream<F>) -> io::Result<()> {
+        let minialloc = stream.minialloc()?;
+        write_data_to_stream(
+            &mut minialloc.write().unwrap(),
+            stream.stream_id,
+            stream.buf_offset_from_start,
+            stream.buffer.filled_slice(),
+        )?;
+        debug_assert_eq!(
+            minialloc.read().unwrap().dir_entry(stream.stream_id).stream_len,
+            stream.total_len
+        );
+        Ok(())
+    }
+}
+
+//===========================================================================//
+
+/// The number of bytes the chain behind the stream can hold, which bounds
+/// what a read can return however long the directory entry claims the
+/// stream is.
+fn stream_capacity<F: Read + Seek>(
+    minialloc: &mut MiniAllocator<F>,
+    stream_id: u32,
+) -> io::Result<u64> {
+    let (start_sector, stream_len) = {
+        let dir_entry = minialloc.dir_entry(stream_id);
+        (dir_entry.start_sector, dir_entry.stream_len)
+    };
+    if start_sector == consts::END_OF_CHAIN {
+        Ok(0)
+    } else if stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+        Ok(minialloc.open_mini_chain(start_sector)?.len())
+    } else {
+        Ok(minialloc.open_chain(start_sector, SectorInit::Zero)?.len())
+    }
+}
+
+fn read_data_from_stream<F: Read + Seek>(
+    minialloc: &mut MiniAllocator<F>,
+    stream_id: u32,
+    buf_offset_from_start: u64,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    let (start_sector, stream_len) = {
+        let dir_entry = minialloc.dir_entry(stream_id);
+        debug_assert_eq!(dir_entry.obj_type, ObjType::Stream);
+        (dir_entry.start_sector, dir_entry.stream_len)
+    };
+    let num_bytes = if buf_offset_from_start >= stream_len {
+        0
+    } else {
+        let remaining = stream_len - buf_offset_from_start;
+        if remaining < buf.len() as u64 {
+            remaining as usize
+        } else {
+            buf.len()
+        }
+    };
+    if num_bytes > 0 {
+        if stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            let mut chain = minialloc.open_mini_chain(start_sector)?;
+            chain.seek(SeekFrom::Start(buf_offset_from_start))?;
+            chain.read_exact(&mut buf[..num_bytes])?;
+        } else {
+            let mut chain =
+                minialloc.open_chain(start_sector, SectorInit::Zero)?;
+            chain.seek(SeekFrom::Start(buf_offset_from_start))?;
+            chain.read_exact(&mut buf[..num_bytes])?;
+        }
+    }
+    Ok(num_bytes)
+}
+
+fn write_data_to_stream<F: Read + Write + Seek>(
+    minialloc: &mut MiniAllocator<F>,
+    stream_id: u32,
+    buf_offset_from_start: u64,
+    buf: &[u8],
+) -> io::Result<()> {
+    let (old_start_sector, old_stream_len) = {
+        let dir_entry = minialloc.dir_entry(stream_id);
+        debug_assert_eq!(dir_entry.obj_type, ObjType::Stream);
+        (dir_entry.start_sector, dir_entry.stream_len)
+    };
+    debug_assert!(buf_offset_from_start <= old_stream_len);
+    let new_stream_len =
+        old_stream_len.max(buf_offset_from_start + buf.len() as u64);
+    let new_start_sector = if old_start_sector == consts::END_OF_CHAIN {
+        // Case 1: The stream has no existing chain.  The stream is empty, and
+        // we are writing at the start.
+        debug_assert_eq!(old_stream_len, 0);
+        debug_assert_eq!(buf_offset_from_start, 0);
+        if new_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            // Case 1a: The data we're writing is small enough that it
+            // should be placed into a new mini chain.
+            let mut chain = minialloc.open_mini_chain(consts::END_OF_CHAIN)?;
+            chain.write_all(buf)?;
+            chain.start_sector_id()
+        } else {
+            // Case 1b: The data we're writing is large enough that it should be placed
+            // into a new regular chain.
+            let mut chain = minialloc
+                .open_chain(consts::END_OF_CHAIN, SectorInit::Zero)?;
+            chain.write_all(buf)?;
+            chain.start_sector_id()
+        }
+    } else if old_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+        // Case 2: The stream currently exists in a mini chain.
+        if new_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            // Case 2a: After the write, the stream will still be small enough
+            // to stay in the mini stream.  Therefore, we should write into
+            // this stream's existing mini chain.
+            let mut chain = minialloc.open_mini_chain(old_start_sector)?;
+            chain.seek(SeekFrom::Start(buf_offset_from_start))?;
+            chain.write_all(buf)?;
+            debug_assert_eq!(chain.start_sector_id(), old_start_sector);
+            old_start_sector
+        } else {
+            // Case 2b: After the write, the stream will be large enough that
+            // it cannot be in the mini stream.  Therefore, we should migrate
+            // the stream into a new regular chain.
+            debug_assert!(
+                buf_offset_from_start < consts::MINI_STREAM_CUTOFF as u64
+            );
+            let mut tmp = vec![0u8; buf_offset_from_start as usize];
+            let mut chain = minialloc.open_mini_chain(old_start_sector)?;
+            chain.read_exact(&mut tmp)?;
+            chain.free()?;
+            let mut chain = minialloc
+                .open_chain(consts::END_OF_CHAIN, SectorInit::Zero)?;
+            chain.write_all(&tmp)?;
+            chain.write_all(buf)?;
+            chain.start_sector_id()
+        }
+    } else {
+        // Case 3: The stream currently exists in a regular chain.  After the
+        // write, it will of course still be too big to be in the mini stream.
+        // Therefore, we should write into this stream's existing chain.
+        debug_assert!(new_stream_len >= consts::MINI_STREAM_CUTOFF as u64);
+        let mut chain =
+            minialloc.open_chain(old_start_sector, SectorInit::Zero)?;
+        chain.seek(SeekFrom::Start(buf_offset_from_start))?;
+        chain.write_all(buf)?;
+        debug_assert_eq!(chain.start_sector_id(), old_start_sector);
+        old_start_sector
+    };
+    // Update the directory entry for this stream.
+    minialloc.with_dir_entry_mut(stream_id, |dir_entry| {
+        dir_entry.start_sector = new_start_sector;
+        dir_entry.stream_len = new_stream_len;
+    })
+}
+
+/// If `new_stream_len` is less than the stream's current length, then the
+/// stream will be truncated.  If it is greater than the stream's current size,
+/// then the stream will be padded with zero bytes.
+fn resize_stream<F: Read + Write + Seek>(
+    minialloc: &mut MiniAllocator<F>,
+    stream_id: u32,
+    new_stream_len: u64,
+) -> io::Result<()> {
+    let (old_start_sector, old_stream_len) = {
+        let dir_entry = minialloc.dir_entry(stream_id);
+        debug_assert_eq!(dir_entry.obj_type, ObjType::Stream);
+        (dir_entry.start_sector, dir_entry.stream_len)
+    };
+    let new_start_sector = if old_start_sector == consts::END_OF_CHAIN {
+        // Case 1: The stream has no existing chain.  We will allocate a new
+        // chain that is all zeroes.
+        debug_assert_eq!(old_stream_len, 0);
+        if new_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            // Case 1a: The new length is small enough that it should be placed
+            // into a new mini chain.
+            let mut chain = minialloc.open_mini_chain(consts::END_OF_CHAIN)?;
+            chain.set_len(new_stream_len)?;
+            chain.start_sector_id()
+        } else {
+            // Case 1b: The new length is large enough that it should be placed
+            // into a new regular chain.
+            let mut chain = minialloc
+                .open_chain(consts::END_OF_CHAIN, SectorInit::Zero)?;
+            chain.set_len(new_stream_len)?;
+            chain.start_sector_id()
+        }
+    } else if old_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+        // Case 2: The stream currently exists in a mini chain.
+        if new_stream_len == 0 {
+            // Case 2a: The new length is zero.  Free the existing mini chain.
+            minialloc.free_mini_chain(old_start_sector)?;
+            consts::END_OF_CHAIN
+        } else if new_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            // Case 2b: The new length is still small enough to fit in a mini
+            // chain.  Therefore, we just need to adjust the length of the
+            // existing chain.  When growing, the bytes between the old and
+            // new lengths in the last mini sector must read as zeros.
+            let mut chain = minialloc.open_mini_chain(old_start_sector)?;
+            if new_stream_len > old_stream_len {
+                chain.zero_tail(old_stream_len)?;
+            }
+            chain.set_len(new_stream_len)?;
+            debug_assert_eq!(chain.start_sector_id(), old_start_sector);
+            old_start_sector
+        } else {
+            // Case 2c: The new length is too large to fit in a mini chain.
+            // Therefore, we should migrate the stream into a new regular
+            // chain.
+            let mut tmp = vec![0u8; old_stream_len as usize];
+            let mut chain = minialloc.open_mini_chain(old_start_sector)?;
+            chain.read_exact(&mut tmp)?;
+            chain.free()?;
+            let mut chain = minialloc
+                .open_chain(consts::END_OF_CHAIN, SectorInit::Zero)?;
+            chain.write_all(&tmp)?;
+            chain.set_len(new_stream_len)?;
+            chain.start_sector_id()
+        }
+    } else {
+        // Case 3: The stream currently exists in a regular chain.
+        if new_stream_len == 0 {
+            // Case 3a: The new length is zero.  Free the existing chain.
+            minialloc.free_chain(old_start_sector)?;
+            consts::END_OF_CHAIN
+        } else if new_stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            // Case 3b: The new length is small enough to fit in a mini chain.
+            // Therefore, we should migrate the stream into a new mini chain.
+            debug_assert!(new_stream_len < old_stream_len);
+            let mut tmp = vec![0u8; new_stream_len as usize];
+            let mut chain =
+                minialloc.open_chain(old_start_sector, SectorInit::Zero)?;
+            chain.read_exact(&mut tmp)?;
+            chain.free()?;
+            let mut chain = minialloc.open_mini_chain(consts::END_OF_CHAIN)?;
+            chain.write_all(&tmp)?;
+            chain.start_sector_id()
+        } else {
+            // Case 3c: The new length is still too large to fit in a mini
+            // chain.  Therefore, we just need to adjust the length of the
+            // existing chain.  When growing, the bytes between the old and
+            // new lengths in the last sector must read as zeros.
+            let mut chain =
+                minialloc.open_chain(old_start_sector, SectorInit::Zero)?;
+            if new_stream_len > old_stream_len {
+                chain.zero_tail(old_stream_len)?;
+            }
+            chain.set_len(new_stream_len)?;
+            debug_assert_eq!(chain.start_sector_id(), old_start_sector);
+            old_start_sector
+        }
+    };
+    // Update the directory entry for this stream.
+    minialloc.with_dir_entry_mut(stream_id, |dir_entry| {
+        dir_entry.start_sector = new_start_sector;
+        dir_entry.stream_len = new_stream_len;
+    })
+}
+
+//===========================================================================//

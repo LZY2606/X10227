@@ -1,0 +1,260 @@
+use crate::internal::{consts, Allocator, SectorInit};
+use std::cmp;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem;
+
+//===========================================================================//
+
+pub struct Chain<'a, F: 'a> {
+    allocator: &'a mut Allocator<F>,
+    init: SectorInit,
+    sector_ids: Vec<u32>,
+    offset_from_start: u64,
+}
+
+impl<'a, F> Chain<'a, F> {
+    pub fn new(
+        allocator: &'a mut Allocator<F>,
+        start_sector_id: u32,
+        init: SectorInit,
+    ) -> io::Result<Chain<'a, F>> {
+        let mut sector_ids = Vec::<u32>::new();
+        let mut current_sector_id = start_sector_id;
+        let first_sector_id = start_sector_id;
+        while current_sector_id != consts::END_OF_CHAIN {
+            sector_ids.push(current_sector_id);
+            current_sector_id = allocator.next(current_sector_id)?;
+            if current_sector_id == first_sector_id {
+                invalid_data!(
+                    "Chain contained duplicate sector id {}",
+                    current_sector_id
+                );
+            }
+        }
+        Ok(Chain { allocator, init, sector_ids, offset_from_start: 0 })
+    }
+
+    /// Creates a chain from sector IDs that are known to match the FAT.
+    pub(crate) fn from_sector_ids(
+        allocator: &'a mut Allocator<F>,
+        sector_ids: Vec<u32>,
+        init: SectorInit,
+    ) -> Chain<'a, F> {
+        Chain { allocator, init, sector_ids, offset_from_start: 0 }
+    }
+
+    pub fn start_sector_id(&self) -> u32 {
+        self.sector_ids.first().copied().unwrap_or(consts::END_OF_CHAIN)
+    }
+
+    /// The IDs of the sectors in this chain, in order.
+    pub fn sector_ids(&self) -> &[u32] {
+        &self.sector_ids
+    }
+
+    pub fn num_sectors(&self) -> usize {
+        self.sector_ids.len()
+    }
+
+    pub fn len(&self) -> u64 {
+        (self.allocator.sector_len() as u64) * (self.sector_ids.len() as u64)
+    }
+}
+
+impl<'a, F> Chain<'a, F> {
+    /// How many sectors from `index` on are consecutive in the file (and so
+    /// can be read or written in one go), looking no further than needed
+    /// to cover `wanted` bytes from `offset_within_sector` into the first.
+    fn run_len(
+        &self,
+        index: usize,
+        offset_within_sector: u64,
+        wanted: usize,
+    ) -> usize {
+        let sector_len = self.allocator.sector_len() as u64;
+        let mut run = 1;
+        while index + run < self.sector_ids.len()
+            && self.sector_ids[index + run]
+                == self.sector_ids[index + run - 1] + 1
+            && run as u64 * sector_len - offset_within_sector < wanted as u64
+        {
+            run += 1;
+        }
+        run
+    }
+}
+
+impl<'a, F: Write + Seek> Chain<'a, F> {
+    /// Adds `count` sectors to the end of the chain, of which the first
+    /// `uninit` are left uninitialized because they are about to be
+    /// overwritten.
+    fn extend_by(&mut self, count: usize, uninit: usize) -> io::Result<()> {
+        let last_sector_id =
+            self.sector_ids.last().copied().unwrap_or(consts::END_OF_CHAIN);
+        let new_sector_ids = self.allocator.extend_chain_by(
+            last_sector_id,
+            count,
+            self.init,
+            uninit,
+        )?;
+        self.sector_ids.extend(new_sector_ids);
+        Ok(())
+    }
+
+    /// Resizes the chain to the minimum number of sectors large enough to old
+    /// `new_len` bytes, allocating or freeing sectors as needed.
+    pub fn set_len(&mut self, new_len: u64) -> io::Result<()> {
+        let sector_len = self.allocator.sector_len() as u64;
+        let new_num_sectors =
+            ((sector_len + new_len - 1) / sector_len) as usize;
+        if new_num_sectors == 0 {
+            if let Some(&start_sector) = self.sector_ids.first() {
+                self.allocator.free_chain(start_sector)?;
+                self.sector_ids.clear();
+            }
+        } else if new_num_sectors <= self.sector_ids.len() {
+            if new_num_sectors < self.sector_ids.len() {
+                self.allocator
+                    .free_chain_after(self.sector_ids[new_num_sectors - 1])?;
+                self.sector_ids.truncate(new_num_sectors);
+            }
+            self.zero_tail(new_len)?;
+        } else {
+            self.extend_by(new_num_sectors - self.sector_ids.len(), 0)?;
+        }
+        Ok(())
+    }
+
+    /// Overwrites with zeros the bytes from `offset` to the end of the sector
+    /// containing it, so that no stale data lingers past a stream's length.
+    /// Does nothing if `offset` is at the start of a sector.
+    pub fn zero_tail(&mut self, offset: u64) -> io::Result<()> {
+        let sector_len = self.allocator.sector_len() as u64;
+        let offset_within_sector = offset % sector_len;
+        if offset_within_sector == 0 {
+            return Ok(());
+        }
+        debug_assert!(offset < self.len());
+        let sector_id = self.sector_ids[(offset / sector_len) as usize];
+        let zeros = vec![0u8; (sector_len - offset_within_sector) as usize];
+        self.allocator
+            .seek_within_sector(sector_id, offset_within_sector)?
+            .write_all(&zeros)
+    }
+
+    pub fn free(mut self) -> io::Result<()> {
+        let start_sector_id = self.start_sector_id();
+        self.sector_ids.clear();
+        self.allocator.free_chain(start_sector_id)
+    }
+}
+
+impl<'a, F> Drop for Chain<'a, F> {
+    fn drop(&mut self) {
+        // The list is kept in step with every change this chain made to the
+        // FAT, so the next chain opened for the same start sector can reuse
+        // it instead of walking the FAT again.
+        if !self.sector_ids.is_empty() {
+            let start_sector_id = self.sector_ids[0];
+            self.allocator
+                .cache_chain(start_sector_id, mem::take(&mut self.sector_ids));
+        }
+    }
+}
+
+impl<'a, F> Seek for Chain<'a, F> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let length = self.len();
+        let new_offset = match pos {
+            SeekFrom::Start(delta) => delta as i64,
+            SeekFrom::End(delta) => delta + length as i64,
+            SeekFrom::Current(delta) => delta + self.offset_from_start as i64,
+        };
+        if new_offset < 0 || (new_offset as u64) > length {
+            invalid_input!(
+                "Cannot seek to {}, chain length is {} bytes",
+                new_offset,
+                length
+            );
+        }
+        self.offset_from_start = new_offset as u64;
+        Ok(self.offset_from_start)
+    }
+}
+
+impl<'a, F: Read + Seek> Read for Chain<'a, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let total_len = self.len();
+        debug_assert!(self.offset_from_start <= total_len);
+        let remaining_in_chain = total_len - self.offset_from_start;
+        let max_len = cmp::min(buf.len() as u64, remaining_in_chain) as usize;
+        if max_len == 0 {
+            return Ok(0);
+        }
+        let sector_len = self.allocator.sector_len() as u64;
+        let current_sector_index =
+            (self.offset_from_start / sector_len) as usize;
+        debug_assert!(current_sector_index < self.sector_ids.len());
+        let current_sector_id = self.sector_ids[current_sector_index];
+        let offset_within_sector = self.offset_from_start % sector_len;
+        // Read through as many consecutive sectors as the buffer covers.
+        let run =
+            self.run_len(current_sector_index, offset_within_sector, max_len);
+        let run_len = run as u64 * sector_len - offset_within_sector;
+        let max_len = max_len.min(run_len as usize);
+        let bytes_read = self.allocator.read_contiguous(
+            current_sector_id,
+            offset_within_sector,
+            &mut buf[0..max_len],
+        )?;
+        self.offset_from_start += bytes_read as u64;
+        debug_assert!(self.offset_from_start <= total_len);
+        Ok(bytes_read)
+    }
+}
+
+impl<'a, F: Write + Seek> Write for Chain<'a, F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let total_len = self.len();
+        debug_assert!(self.offset_from_start <= total_len);
+        let sector_len = self.allocator.sector_len() as u64;
+        // Make room for the whole buffer at once.  New sectors that the
+        // buffer fills completely are not zeroed first.
+        let end = self.offset_from_start + buf.len() as u64;
+        if end > total_len {
+            let count = (end - total_len).div_ceil(sector_len) as usize;
+            let filled = ((end - total_len) / sector_len) as usize;
+            self.extend_by(count, filled)?;
+        }
+        let current_sector_index =
+            (self.offset_from_start / sector_len) as usize;
+        debug_assert!(current_sector_index < self.sector_ids.len());
+        let current_sector_id = self.sector_ids[current_sector_index];
+        let offset_within_sector = self.offset_from_start % sector_len;
+        // Write through as many consecutive sectors as the buffer covers.
+        let run = self.run_len(
+            current_sector_index,
+            offset_within_sector,
+            buf.len(),
+        );
+        let run_len = run as u64 * sector_len - offset_within_sector;
+        let max_len = buf.len().min(run_len as usize);
+        let bytes_written = self.allocator.write_contiguous(
+            current_sector_id,
+            offset_within_sector,
+            &buf[..max_len],
+        )?;
+        self.offset_from_start += bytes_written as u64;
+        debug_assert!(self.offset_from_start <= self.len());
+        Ok(bytes_written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.allocator.flush()
+    }
+}
+
+//===========================================================================//
