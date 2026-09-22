@@ -1,6 +1,9 @@
 #[macro_use]
 mod macros;
 
+mod audit;
+mod sha256;
+
 mod alloc;
 mod chain;
 mod color;
@@ -20,6 +23,10 @@ mod timestamp;
 mod validate;
 mod version;
 
+pub use self::audit::{
+    audit_bytes, audit_with, AuditReport, AuditTable, CorruptionEvidence,
+    CorruptionKind, RepairPlan,
+};
 pub use self::alloc::Allocator;
 pub use self::chain::Chain;
 pub use self::color::Color;

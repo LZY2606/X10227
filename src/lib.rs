@@ -61,7 +61,10 @@ use crate::internal::{
     Allocator, DirEntry, Directory, EntriesOrder, Header, MiniAllocator,
     ObjType, SectorInit, Sectors, Timestamp, Validation,
 };
-pub use crate::internal::{Entries, Entry, Stream, Version};
+pub use crate::internal::{
+    audit_with, AuditReport, AuditTable, CorruptionEvidence, CorruptionKind,
+    Entries, Entry, RepairPlan, Stream, Version,
+};
 
 #[macro_use]
 mod internal;
@@ -84,6 +87,23 @@ pub fn open_rw<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 /// a file already exists at the given path, this will overwrite it.
 pub fn create<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
     OpenOptions::new().create(path)
+}
+
+/// Performs an opt-in, read-only structural audit of the compound file at
+/// `path`.
+///
+/// The file is opened read-only and is never modified: no bytes are written,
+/// and no [`CompoundFile`] is produced.  The returned [`AuditReport`] lists
+/// corruption evidence for the FAT, DIFAT, MiniFAT, and directory chain (if
+/// any), each with the precise byte offset of the first offending field, and
+/// can produce a [`RepairPlan`] whose application is a separate, explicit
+/// step guarded by a digest of the audited bytes.
+///
+/// This is intended for diagnosing damaged allocation chains; normal reading
+/// and writing continues to go through [`open`] and [`open_rw`], whose
+/// behavior is unchanged.
+pub fn audit<P: AsRef<Path>>(path: P) -> io::Result<AuditReport> {
+    OpenOptions::new().audit(fs::File::open(path)?)
 }
 
 //===========================================================================//
@@ -160,6 +180,17 @@ impl OpenOptions {
             self.validation,
             self.max_buffer_size,
         )
+    }
+
+    /// Runs a read-only structural audit over the given reader.
+    ///
+    /// Audit analysis is independent of this options struct's buffer and
+    /// validation settings (it never mutates the input and reports every
+    /// corruption rather than repairing tolerated ones), but providing it on
+    /// [`OpenOptions`] keeps the opt-in audit discoverable next to `open`.
+    /// The reader is only read from; this method never writes a byte.
+    pub fn audit<F: Read + Seek>(self, inner: F) -> io::Result<AuditReport> {
+        audit_with(inner)
     }
 
     /// Creates a new compound file with no contents using the underlying writer.
