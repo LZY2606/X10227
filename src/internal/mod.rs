@@ -2,6 +2,7 @@
 mod macros;
 
 mod alloc;
+mod audit;
 mod chain;
 mod color;
 pub mod consts;
@@ -21,6 +22,11 @@ mod validate;
 mod version;
 
 pub use self::alloc::Allocator;
+pub use self::audit::{
+    AuditReport, AuditTable, ChainOwner, Corruption, CorruptionKind,
+    Evidence, RepairPlan, WordPatch,
+};
+pub(crate) use self::audit::audit_structure;
 pub use self::chain::Chain;
 pub use self::color::Color;
 pub use self::directory::Directory;

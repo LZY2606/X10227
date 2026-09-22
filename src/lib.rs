@@ -61,7 +61,21 @@ use crate::internal::{
     Allocator, DirEntry, Directory, EntriesOrder, Header, MiniAllocator,
     ObjType, SectorInit, Sectors, Timestamp, Validation,
 };
-pub use crate::internal::{Entries, Entry, Stream, Version};
+pub use crate::internal::{
+    AuditReport, AuditTable, ChainOwner, Corruption, CorruptionKind, Entries,
+    Entry, Evidence, RepairPlan, Stream, Version, WordPatch,
+};
+
+/// Performs an opt-in, read-only structural audit of an existing compound
+/// file without opening (or mutating) it.  The returned [`AuditReport`]
+/// records corruption evidence for the FAT, DIFAT, MiniFAT and directory
+/// chain, and (when possible) a read-only [`RepairPlan`] bound to a digest
+/// of the input bytes.  This function never writes to `reader`.
+pub fn audit_structure<F: Read + Seek>(
+    reader: F,
+) -> io::Result<AuditReport> {
+    internal::audit_structure(reader, Validation::Permissive)
+}
 
 #[macro_use]
 mod internal;
@@ -70,12 +84,12 @@ mod internal;
 
 /// Opens an existing compound file at the given path in read-only mode.
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
-    OpenOptions::new().open(path)
+    OpenOptions::new().open(path)?.compound()
 }
 
 /// Opens an existing compound file at the given path in read-write mode.
 pub fn open_rw<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
-    OpenOptions::new().open_rw(path)
+    OpenOptions::new().open_rw(path)?.compound()
 }
 
 /// Creates a new compound file with no contents at the given path.
@@ -92,6 +106,7 @@ pub fn create<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 pub struct OpenOptions {
     pub(crate) max_buffer_size: usize,
     pub(crate) validation: Validation,
+    pub(crate) audit: bool,
 }
 
 impl OpenOptions {
@@ -116,19 +131,34 @@ impl OpenOptions {
         self
     }
 
+    /// Opt in to a one-shot, read-only structural audit when opening.  With
+    /// this set, [`OpenOptions::open`], [`OpenOptions::open_rw`], and
+    /// [`OpenOptions::open_with`] return an [`AuditReport`] instead of a
+    /// [`CompoundFile`]: the audit describes any FAT, DIFAT, MiniFAT or
+    /// directory-chain corruption and (when one can be produced safely) a
+    /// read-only [`RepairPlan`].  The audited bytes are never modified.
+    pub fn audit(mut self) -> Self {
+        self.audit = true;
+        self
+    }
+
     /// Opens an existing compound file at the given path in read-only mode.
+    /// If [`OpenOptions::audit`] was set, returns an [`AuditReport`] instead
+    /// and does not mutate the file.
     pub fn open<P: AsRef<Path>>(
         self,
         path: P,
-    ) -> io::Result<CompoundFile<fs::File>> {
+    ) -> io::Result<OpenOutput<fs::File>> {
         self.open_with(fs::File::open(path)?)
     }
 
     /// Opens an existing compound file at the given path in read-write mode.
+    /// If [`OpenOptions::audit`] was set, returns an [`AuditReport`] instead
+    /// (the file is only read, never written).
     pub fn open_rw<P: AsRef<Path>>(
         self,
         path: P,
-    ) -> io::Result<CompoundFile<fs::File>> {
+    ) -> io::Result<OpenOutput<fs::File>> {
         let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
         self.open_with(file)
     }
@@ -150,16 +180,25 @@ impl OpenOptions {
         self.create_with(file)
     }
 
-    /// Opens an existing compound file using the underlying reader.
+    /// Opens an existing compound file using the underlying reader.  If
+    /// [`OpenOptions::audit`] was set, returns an [`AuditReport`] without
+    /// mutating the reader.
     pub fn open_with<F: Read + Seek>(
         self,
         inner: F,
-    ) -> io::Result<CompoundFile<F>> {
-        CompoundFile::open_internal(
-            inner,
-            self.validation,
-            self.max_buffer_size,
-        )
+    ) -> io::Result<OpenOutput<F>> {
+        if self.audit {
+            Ok(OpenOutput::Audit(internal::audit_structure(
+                inner,
+                self.validation,
+            )?))
+        } else {
+            Ok(OpenOutput::Compound(CompoundFile::open_internal(
+                inner,
+                self.validation,
+                self.max_buffer_size,
+            )?))
+        }
     }
 
     /// Creates a new compound file with no contents using the underlying writer.
@@ -180,6 +219,38 @@ impl Default for OpenOptions {
         OpenOptions {
             max_buffer_size: DEFAULT_STREAM_MAX_BUFFER_SIZE,
             validation: Validation::Permissive,
+            audit: false,
+        }
+    }
+}
+
+/// The output of an [`OpenOptions`] open call: either an opened
+/// [`CompoundFile`], or (when auditing was requested) an [`AuditReport`].
+#[derive(Debug)]
+pub enum OpenOutput<F> {
+    /// A normally opened compound file.
+    Compound(CompoundFile<F>),
+    /// A read-only structural audit report.
+    Audit(AuditReport),
+}
+
+impl<F> OpenOutput<F> {
+    /// Returns the opened compound file, or `Err(InvalidData)` if this output
+    /// is an audit report.
+    pub fn compound(self) -> io::Result<CompoundFile<F>> {
+        match self {
+            OpenOutput::Compound(comp) => Ok(comp),
+            OpenOutput::Audit(_) => invalid_data!(
+                "OpenOptions::audit() was set, so this open produced an                  AuditReport rather than a CompoundFile"
+            ),
+        }
+    }
+
+    /// Returns the audit report, or `None` for a normal open.
+    pub fn audit_report(self) -> Option<AuditReport> {
+        match self {
+            OpenOutput::Audit(report) => Some(report),
+            OpenOutput::Compound(_) => None,
         }
     }
 }
@@ -414,7 +485,7 @@ impl<F: Read + Seek> CompoundFile<F> {
     /// underlying reader also supports the `Write` trait, then the
     /// `CompoundFile` object will be writable as well.
     pub fn open(inner: F) -> io::Result<CompoundFile<F>> {
-        OpenOptions::new().open_with(inner)
+        OpenOptions::new().open_with(inner)?.compound()
     }
 
     /// Like `open()`, but is stricter when parsing and will return an error if
@@ -423,7 +494,7 @@ impl<F: Read + Seek> CompoundFile<F> {
     /// implementation (such as this crate itself) to help ensure compatibility
     /// with other readers.
     pub fn open_strict(inner: F) -> io::Result<CompoundFile<F>> {
-        OpenOptions::new().strict().open_with(inner)
+        OpenOptions::new().strict().open_with(inner)?.compound()
     }
 
     fn open_internal(
