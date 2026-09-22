@@ -63,6 +63,8 @@ use crate::internal::{
 };
 pub use crate::internal::{Entries, Entry, Stream, Version};
 
+pub mod audit;
+
 #[macro_use]
 mod internal;
 

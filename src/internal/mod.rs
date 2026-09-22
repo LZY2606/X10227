@@ -2,6 +2,7 @@
 mod macros;
 
 mod alloc;
+mod audit;
 mod chain;
 mod color;
 pub mod consts;
