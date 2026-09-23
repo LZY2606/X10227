@@ -66,6 +66,14 @@ pub use crate::internal::{Entries, Entry, Stream, Version};
 #[macro_use]
 mod internal;
 
+/// Opt-in structural audit and read-only repair planning for damaged
+/// allocation chains (FAT, DIFAT, MiniFAT, directory chain).
+pub mod audit;
+pub use audit::{
+    ApplyOutcome, AuditReport, ChainKind, ChainLayer, Digest, Evidence,
+    RepairPlan, RepairStep, RepairStepView,
+};
+
 //===========================================================================//
 
 /// Opens an existing compound file at the given path in read-only mode.
@@ -76,6 +84,14 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 /// Opens an existing compound file at the given path in read-write mode.
 pub fn open_rw<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
     OpenOptions::new().open_rw(path)
+}
+
+/// Runs the opt-in structural audit over an openable reader.
+///
+/// Unlike [`open`], damaged chains never cause an error here: they are
+/// collected in the returned [`AuditReport`].  The input is not modified.
+pub fn audit<F: Read + Seek>(inner: F) -> io::Result<AuditReport> {
+    AuditReport::new(inner)
 }
 
 /// Creates a new compound file with no contents at the given path.
@@ -148,6 +164,17 @@ impl OpenOptions {
             .truncate(true)
             .open(path)?;
         self.create_with(file)
+    }
+
+    /// Opt-in structural audit through the same options surface used to
+    /// open compound files.  This never writes: it performs the tolerant
+    /// FAT/DIFAT/MiniFAT/directory audit only.
+    pub fn audit_with<F: Read + Seek>(
+        self,
+        inner: F,
+    ) -> io::Result<AuditReport> {
+        let _ = (self.validation, self.max_buffer_size);
+        AuditReport::new(inner)
     }
 
     /// Opens an existing compound file using the underlying reader.
