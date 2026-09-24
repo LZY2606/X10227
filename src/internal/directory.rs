@@ -135,6 +135,10 @@ impl<F> Directory<F> {
         self.allocator.inner()
     }
 
+    pub fn mut_inner(&mut self) -> &mut F {
+        self.allocator.mut_inner()
+    }
+
     pub fn sector_len(&self) -> usize {
         self.allocator.sector_len()
     }

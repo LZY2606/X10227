@@ -2,6 +2,7 @@
 mod macros;
 
 mod alloc;
+pub(crate) mod audit_engine;
 mod chain;
 mod color;
 pub mod consts;

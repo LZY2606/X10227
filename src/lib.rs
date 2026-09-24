@@ -63,6 +63,8 @@ use crate::internal::{
 };
 pub use crate::internal::{Entries, Entry, Stream, Version};
 
+pub mod audit;
+
 #[macro_use]
 mod internal;
 
@@ -173,6 +175,31 @@ impl OpenOptions {
             self.max_buffer_size,
         )
     }
+
+    /// Audits an existing compound file without opening it for normal use.
+    ///
+    /// Unlike [`OpenOptions::open`], this never fails merely because an
+    /// allocation chain is damaged: the audit tolerantly reads the image and
+    /// instead reports the corruption as evidence, together with a read-only
+    /// repair plan.  This method reads `inner` to completion and never writes
+    /// to it.
+    pub fn audit_only<F: Read + Seek>(
+        self,
+        mut inner: F,
+    ) -> io::Result<audit::AuditReport> {
+        inner.seek(SeekFrom::Start(0))?;
+        let mut data = Vec::new();
+        inner.read_to_end(&mut data)?;
+        audit::audit_bytes(&data)
+    }
+
+    /// Like [`OpenOptions::audit_only`], but takes a path.
+    pub fn audit_path<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> io::Result<audit::AuditReport> {
+        self.audit_only(fs::File::open(path)?)
+    }
 }
 
 impl Default for OpenOptions {
@@ -192,6 +219,7 @@ impl Default for OpenOptions {
 pub struct CompoundFile<F> {
     minialloc: Arc<RwLock<MiniAllocator<F>>>,
     max_buffer_size: usize,
+    validation: Validation,
 }
 
 impl<F> CompoundFile<F> {
@@ -424,6 +452,22 @@ impl<F: Read + Seek> CompoundFile<F> {
     /// with other readers.
     pub fn open_strict(inner: F) -> io::Result<CompoundFile<F>> {
         OpenOptions::new().strict().open_with(inner)
+    }
+
+    /// Runs the opt-in structural audit on this compound file: reports
+    /// damage to the DIFAT, FAT, directory chain and MiniFAT, and builds a
+    /// read-only repair plan.  This takes the read lock only long enough to
+    /// read the underlying image; it never writes through this
+    /// [`CompoundFile`].
+    pub fn audit(&mut self) -> io::Result<audit::AuditReport> {
+        let mut data = Vec::new();
+        {
+            let mut minialloc = self.minialloc_mut();
+            let inner = minialloc.mut_inner();
+            inner.seek(SeekFrom::Start(0))?;
+            inner.read_to_end(&mut data)?;
+        }
+        audit::audit_bytes(&data)
     }
 
     fn open_internal(
@@ -698,6 +742,7 @@ impl<F: Read + Seek> CompoundFile<F> {
         Ok(CompoundFile {
             minialloc: Arc::new(RwLock::new(minialloc)),
             max_buffer_size,
+            validation,
         })
     }
     /// Writes a compacted copy of this compound file to `dest`, and returns
@@ -758,6 +803,27 @@ impl<F> CompoundFile<F> {
 }
 
 impl<F: Read + Write + Seek> CompoundFile<F> {
+    /// Applies an explicit, digest-gated repair plan to this compound file.
+    ///
+    /// The current file must still match the plan's
+    /// [`audit::RepairPlan::prerequisite_digest`]; otherwise no bytes are
+    /// written and an [`io::ErrorKind::InvalidData`] error is returned.
+    /// Writes are journaled, so if any write fails every earlier write is
+    /// rolled back and the file is left byte-for-byte unchanged.  On success
+    /// the in-memory structure is rebuilt from the repaired bytes through the
+    /// same parsing path as a fresh open, so no stale cache, count or chain
+    /// state survives.
+    pub fn apply_repair_plan(
+        self,
+        plan: &audit::RepairPlan,
+    ) -> io::Result<CompoundFile<F>> {
+        let max_buffer_size = self.max_buffer_size;
+        let validation = self.validation;
+        let mut inner = self.into_inner();
+        audit::apply_plan_to_writer(&mut inner, plan)?;
+        CompoundFile::open_internal(inner, validation, max_buffer_size)
+    }
+
     /// Creates a new compound file with no contents, using the underlying
     /// reader/writer.  The reader/writer should be initially empty.
     pub fn create(inner: F) -> io::Result<CompoundFile<F>> {
@@ -846,6 +912,7 @@ impl<F: Read + Write + Seek> CompoundFile<F> {
         Ok(CompoundFile {
             minialloc: Arc::new(RwLock::new(minialloc)),
             max_buffer_size,
+            validation: Validation::Strict,
         })
     }
 

@@ -66,6 +66,13 @@ impl<F> MiniAllocator<F> {
         self.directory.inner()
     }
 
+    /// Mutable access to the underlying reader/writer.  Callers must restore
+    /// the on-disk state to something parseable through the normal open path
+    /// before releasing the lock (the audit repair path reopens afterwards).
+    pub fn mut_inner(&mut self) -> &mut F {
+        self.directory.mut_inner()
+    }
+
     pub fn next_mini_sector(&self, sector_id: u32) -> io::Result<u32> {
         let index = sector_id as usize;
         if index >= self.minifat.len() {

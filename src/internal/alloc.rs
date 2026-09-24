@@ -62,6 +62,10 @@ impl<F> Allocator<F> {
         self.sectors.inner()
     }
 
+    pub fn mut_inner(&mut self) -> &mut F {
+        self.sectors.mut_inner()
+    }
+
     pub fn sector_len(&self) -> usize {
         self.sectors.sector_len()
     }

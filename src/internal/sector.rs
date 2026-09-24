@@ -40,6 +40,10 @@ impl<F> Sectors<F> {
     pub fn inner(&self) -> &F {
         &self.inner
     }
+
+    pub fn mut_inner(&mut self) -> &mut F {
+        &mut self.inner
+    }
 }
 
 impl<F: Seek> Sectors<F> {
