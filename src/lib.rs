@@ -64,6 +64,13 @@ use crate::internal::{
 pub use crate::internal::{Entries, Entry, Stream, Version};
 
 #[macro_use]
+mod audit;
+pub use crate::audit::{
+    AuditReport, CorruptionCategory, Finding, PreconditionDigest,
+    RepairAction, RepairPlan, RepairPreview, Structure,
+};
+
+#[macro_use]
 mod internal;
 
 //===========================================================================//
@@ -76,6 +83,27 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 /// Opens an existing compound file at the given path in read-write mode.
 pub fn open_rw<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
     OpenOptions::new().open_rw(path)
+}
+
+/// Performs an opt-in structural audit of the compound file at the given
+/// path, without modifying it.
+///
+/// This is a read-only convenience wrapper around
+/// [`OpenOptions::audit`](OpenOptions::audit): the returned
+/// [`AuditReport`] lists the corruption evidence found in the DIFAT, FAT,
+/// MiniFAT and directory chain, together with a read-only
+/// [`RepairPlan`](RepairPlan) that can only be applied explicitly.
+pub fn audit_path<P: AsRef<Path>>(path: P) -> io::Result<AuditReport> {
+    OpenOptions::new().audit(path)
+}
+
+/// Performs an opt-in structural audit of a compound file readable from
+/// `inner`, without modifying it.
+///
+/// The whole input is snapshotted, so this never writes to `inner`.  See
+/// [`audit_path`](audit_path) and [`AuditReport`] for details.
+pub fn audit<F: Read + Seek>(inner: F) -> io::Result<AuditReport> {
+    OpenOptions::new().audit_with(inner)
 }
 
 /// Creates a new compound file with no contents at the given path.
