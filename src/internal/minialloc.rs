@@ -77,11 +77,11 @@ impl<F> MiniAllocator<F> {
             );
         }
         let next_id = self.minifat[index];
-        if next_id != consts::END_OF_CHAIN
-            && (next_id > consts::MAX_REGULAR_SECTOR
-                || next_id as usize >= self.minifat.len())
-        {
-            invalid_data!("next_id ({}) is invalid", next_id);
+        match consts::classify_chain_entry(next_id, self.minifat.len()) {
+            consts::ChainEntry::End | consts::ChainEntry::Sector(_) => {}
+            consts::ChainEntry::Invalid(_) => {
+                invalid_data!("next_id ({}) is invalid", next_id);
+            }
         }
         Ok(next_id)
     }

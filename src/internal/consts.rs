@@ -33,6 +33,36 @@ pub const ROOT_STREAM_ID: u32 = 0;
 pub const MAX_REGULAR_STREAM_ID: u32 = 0xfffffffa;
 pub const NO_STREAM: u32 = 0xffffffff;
 
+/// The classification of a FAT or MiniFAT entry when following a chain.
+/// This is the single definition of what may be followed, shared by the
+/// production chain walkers (`Allocator::next`,
+/// `MiniAllocator::next_mini_sector`) and the read-only structural audit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChainEntry {
+    /// `END_OF_CHAIN`: the chain ends here.
+    End,
+    /// A pointer to another sector that exists in the table.
+    Sector(u32),
+    /// Anything else: a reserved marker (`FREE_SECTOR`, `FAT_SECTOR`, ...)
+    /// or a sector index outside the table.
+    Invalid(u32),
+}
+
+/// Classifies a FAT or MiniFAT entry value, given the number of entries in
+/// the table it belongs to.
+pub(crate) fn classify_chain_entry(
+    entry: u32,
+    num_entries: usize,
+) -> ChainEntry {
+    if entry == END_OF_CHAIN {
+        ChainEntry::End
+    } else if entry <= MAX_REGULAR_SECTOR && (entry as usize) < num_entries {
+        ChainEntry::Sector(entry)
+    } else {
+        ChainEntry::Invalid(entry)
+    }
+}
+
 pub(crate) fn prettify(sectors: &[u32]) -> Vec<Sector> {
     let mut fmt = Vec::new();
     for s in sectors.iter() {
