@@ -63,6 +63,12 @@ use crate::internal::{
 };
 pub use crate::internal::{Entries, Entry, Stream, Version};
 
+pub mod audit;
+pub use crate::audit::{
+    ApplyOutcome, AuditCheckpoint, AuditOptions, AuditOrder, AuditReport,
+    AuditTable, CorruptionKind, Digest, Finding, RepairPatch, RepairPlan,
+};
+
 #[macro_use]
 mod internal;
 
@@ -92,6 +98,7 @@ pub fn create<P: AsRef<Path>>(path: P) -> io::Result<CompoundFile<fs::File>> {
 pub struct OpenOptions {
     pub(crate) max_buffer_size: usize,
     pub(crate) validation: Validation,
+    pub(crate) audit_options: audit::AuditOptions,
 }
 
 impl OpenOptions {
@@ -175,11 +182,85 @@ impl OpenOptions {
     }
 }
 
+    //===================================================================//
+    // Opt-in structural audit and read-only repair planning.
+    //
+    // These entry points never produce a `CompoundFile` from damaged bytes;
+    // they read the input once, analyze it with the same header and
+    // directory parsing code as `open_with`, and hand back evidence.  The
+    // repair methods write only when a plan's prerequisite digest still
+    // matches the target.
+
+    /// Sets the options used by [`OpenOptions::audit_with`] and the repair
+    /// methods.  Audit options have no effect on ordinary
+    /// [`OpenOptions::open`]/[`OpenOptions::create`] calls.
+    pub fn audit_options(mut self, options: audit::AuditOptions) -> Self {
+        self.audit_options = options;
+        self
+    }
+
+    /// Performs an opt-in structural audit of `inner` without modifying it.
+    ///
+    /// The returned [`AuditReport`] lists damage to the FAT, DIFAT,
+    /// MiniFAT, and directory chain as separate, located findings, and can
+    /// produce a read-only [`RepairPlan`].  Auditing works on files that are
+    /// too damaged to open, because it never has to finish parsing them.
+    pub fn audit_with<F: Read + Seek>(
+        self,
+        mut inner: F,
+    ) -> io::Result<AuditReport> {
+        let data = internal::audit_engine::read_all(&mut inner)?;
+        internal::audit_engine::analyze(&data, &self.audit_options)
+    }
+
+    /// Like [`OpenOptions::audit_with`], but reads from the given path.
+    pub fn audit<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> io::Result<AuditReport> {
+        self.audit_with(fs::File::open(path)?)
+    }
+
+    /// Checks `plan` against `inner` without writing a single byte.
+    ///
+    /// This runs the same prerequisite-digest verification and re-audit of
+    /// the repaired image that an actual application runs, but returns
+    /// before the commit.  It therefore fails on plans whose input has
+    /// changed and on plans that would leave damage behind, while
+    /// guaranteeing the target is untouched.
+    pub fn dry_run_repair_with<F: Read + Write + Seek>(
+        self,
+        plan: &RepairPlan,
+        mut inner: F,
+    ) -> io::Result<ApplyOutcome> {
+        let data = internal::audit_engine::read_all(&mut inner)?;
+        internal::audit_engine::dry_run(plan, &data, &self.audit_options)
+    }
+
+    /// Applies `plan` to `inner`, but only while the input still matches the
+    /// plan's prerequisite digest.
+    ///
+    /// The repair image is built and re-audited entirely in memory before
+    /// any byte is written, so a failure before the commit point leaves the
+    /// original file byte-for-byte intact and the identical plan can be
+    /// retried.  A digest mismatch or a plan that cannot fully repair the
+    /// file returns an [`io::Error`] classified as
+    /// [`io::ErrorKind::InvalidData`] without writing.
+    pub fn apply_repair_with<F: Read + Write + Seek>(
+        self,
+        plan: &RepairPlan,
+        mut inner: F,
+    ) -> io::Result<ApplyOutcome> {
+        internal::audit_engine::apply(plan, &mut inner, &self.audit_options)
+    }
+}
+
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
             max_buffer_size: DEFAULT_STREAM_MAX_BUFFER_SIZE,
             validation: Validation::Permissive,
+            audit_options: audit::AuditOptions::default(),
         }
     }
 }

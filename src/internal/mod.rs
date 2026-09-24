@@ -1,6 +1,8 @@
 #[macro_use]
 mod macros;
 
+pub(crate) mod audit_engine;
+
 mod alloc;
 mod chain;
 mod color;
