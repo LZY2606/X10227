@@ -66,6 +66,24 @@ pub use crate::internal::{Entries, Entry, Stream, Version};
 #[macro_use]
 mod internal;
 
+mod audit;
+
+pub use crate::audit::{
+    AuditDigest, AuditReport, Corruption, PlanMismatch, RepairPlan,
+    RepairStep, Table,
+};
+
+/// Audits an existing compound file at the given path without opening it for
+/// mutation and without modifying the input.
+///
+/// The returned report contains separate findings for cycles,
+/// out-of-bounds links, double allocation, orphan sectors, and declared
+/// length mismatches across the FAT, DIFAT, MiniFAT, and directory chains,
+/// plus a read-only repair plan.
+pub fn audit<P: AsRef<Path>>(path: P) -> io::Result<AuditReport> {
+    OpenOptions::new().audit_with(fs::File::open(path)?)
+}
+
 //===========================================================================//
 
 /// Opens an existing compound file at the given path in read-only mode.
@@ -160,6 +178,23 @@ impl OpenOptions {
             self.validation,
             self.max_buffer_size,
         )
+    }
+
+    /// Audits an existing compound file through this options builder
+    /// without opening it for mutation.
+    ///
+    /// This opt-in structural audit reads the file once, records evidence
+    /// of FAT, DIFAT, MiniFAT, and directory-chain damage, and returns a
+    /// read-only repair plan.  It never writes to `inner`: the audit itself
+    /// is the dry run.  The audit ignores the [`strict`](OpenOptions::strict)
+    /// setting on purpose, because damaged files are exactly what it is
+    /// meant to inspect.
+    pub fn audit_with<F: Read + Seek>(
+        self,
+        inner: F,
+    ) -> io::Result<AuditReport> {
+        let _ = (self.validation, self.max_buffer_size);
+        crate::audit::audit_reader(inner)
     }
 
     /// Creates a new compound file with no contents using the underlying writer.
